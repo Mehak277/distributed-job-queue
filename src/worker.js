@@ -1,10 +1,15 @@
-require("dotenv").config({ path: require("path").resolve(__dirname, "../.env") });
+require("dotenv").config({
+  path: require("path").resolve(__dirname, "../.env"),
+});
 
 const { Worker } = require("bullmq");
 const Redis = require("ioredis");
 const pool = require("./db");
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+// Redis connection
 const connection = process.env.REDIS_URL
   ? new Redis(process.env.REDIS_URL, {
       maxRetriesPerRequest: null,
@@ -15,22 +20,7 @@ const connection = process.env.REDIS_URL
       maxRetriesPerRequest: null,
     });
 
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
-
-transporter.verify((error, success) => {
-  if (error) {
-    console.error("Email connection failed:", error.message);
-  } else {
-    console.log("Email service is ready!");
-  }
-});
-
+// BullMQ Worker
 const worker = new Worker(
   "job-queue",
 
@@ -41,10 +31,12 @@ const worker = new Worker(
       console.log("Processing job:", job.id);
       console.log("Job data:", job.data);
 
+      // Current attempt number
       const attemptNumber = job.attemptsMade + 1;
 
       console.log("Attempt:", attemptNumber);
 
+      // Update attempts in PostgreSQL
       await pool.query(
         `UPDATE jobs
          SET attempts = $1,
@@ -55,6 +47,7 @@ const worker = new Worker(
 
       console.log("Database Job ID:", databaseJobId);
 
+      // Mark job as processing
       await pool.query(
         `UPDATE jobs
          SET status = 'processing',
@@ -65,15 +58,23 @@ const worker = new Worker(
 
       console.log("Job status: processing");
 
-      await transporter.sendMail({
-        from: process.env.EMAIL_USER,
-        to: job.data.to,
+      // Send email using Resend API
+      const { data, error } = await resend.emails.send({
+        from: "onboarding@resend.dev",
+        to: [job.data.to],
         subject: job.data.subject,
         text: job.data.message,
       });
 
-      console.log("Email sent successfully!");
+      // Handle Resend error
+      if (error) {
+        throw new Error(error.message);
+      }
 
+      console.log("Email sent successfully via Resend!");
+      console.log("Resend Email ID:", data.id);
+
+      // Mark job as completed
       await pool.query(
         `UPDATE jobs
          SET status = 'completed',
@@ -86,11 +87,13 @@ const worker = new Worker(
 
       return {
         success: true,
+        emailId: data.id,
       };
 
     } catch (error) {
       console.error("Job failed:", error.message);
 
+      // Mark job as failed
       await pool.query(
         `UPDATE jobs
          SET status = 'failed',
@@ -104,13 +107,17 @@ const worker = new Worker(
     }
   },
 
-  { connection }
+  {
+    connection,
+  }
 );
 
+// Worker completed event
 worker.on("completed", (job) => {
   console.log(`Job ${job.id} completed`);
 });
 
+// Worker failed event
 worker.on("failed", (job, err) => {
   console.log(`Job ${job.id} failed: ${err.message}`);
 });
